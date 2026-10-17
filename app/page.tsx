@@ -7,7 +7,7 @@ import { useChat } from "@ai-sdk/react";
 const MODELS = [
   { id: "openai/gpt-4o-mini", name: "GPT-4o mini (OpenAI)" },
   { id: "anthropic/claude-haiku-5.5", name: "Claude Haiku 5.5 (Anthropic)" },
-  { id: "google/gemini-2.0-flash-001", name: "Gemini 2.0 Flash (Google)" },
+  { id: "google/gemini-2.5-flash", name: "Gemini 2.5 Flash (Google)" },
   { id: "meta-llama/llama-3.3-70b-instruct", name: "Llama 3.3 70B (Meta)" },
   { id: "mistralai/mistral-small-3.2-24b-instruct", name: "Mistral Small (Mistral)" },
 ];
