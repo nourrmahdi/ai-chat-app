@@ -37,8 +37,8 @@ A chat application connected to many LLM providers through **OpenRouter**. You c
 - **Exact spreadsheet calculations** (`analyzeTable`): totals, averages, counts, min and max, filtered and grouped (e.g. "revenue per region"), computed **in code** on the real file instead of by the model, so numbers are always correct. Results can be saved as Excel or CSV.
 - **File generation with download** (`createFile`): **Word (.docx)**, **PDF**, **Excel (.xlsx)**, **CSV**, **Markdown**, **text** and **code** files, with headings, bullet points, bold text and tables.
 - **Edited files**: ask for changes to an uploaded file (e.g. "fix the bug in this script", "rewrite this report more formally") and get the new version back as a file.
-- **Large documents** are handled with **RAG** (embeddings + semantic search), **part-by-part reading**, and **map-reduce summaries**, so a 184-page PDF (~160k tokens) works even with GPT-4o mini (128K context).
-- **Visible agent steps**: the chat shows what the model did, e.g. "Searched documents for 'vacation days' · 8 passages found" or "Summarized 'handbook.pdf' in 12 sections".
+- **Large documents** are handled with **RAG**: embeddings stored in **Supabase pgvector**, **hybrid search** (meaning + keywords), **part-by-part reading**, and **map-reduce summaries**, so a 184-page PDF (~160k tokens) works even with GPT-4o mini (128K context).
+- **Visible agent steps**: the chat shows what the model did, e.g. "Searched documents for 'vacation days' · 8 passages found · pgvector" or "Summarized 'handbook.pdf' in 12 sections".
 - **Works across models**: documents stay in the conversation when switching models, and even the **text-only Llama** model can use them, because models receive text, not the original file.
 
 ---
@@ -70,7 +70,8 @@ All five can use documents and every tool.
 ```
 Browser (components/chat.tsx)
   │  Images    → /api/upload → Vercel Blob
-  │  Documents → /api/files  → parse → split into parts → embeddings → Vercel Blob
+  │  Documents → /api/files  → parse → split into parts → embeddings
+  │                             → Supabase pgvector (one row per part) + Vercel Blob (file + backup)
   │  The message (text + file URLs) and the full history are sent with the chosen model
   ▼
 /api/chat (server)                                   ← API keys live only here
@@ -84,7 +85,7 @@ Chat model (via OpenRouter) decides what to do, for example:
   ▼
 Tools (server, lib/tools.ts)
   │  generateImage      image generation / editing (Project 3)
-  │  searchDocuments    semantic search over all documents in the chat (RAG)
+  │  searchDocuments    hybrid search (pgvector + keywords) over the chat's documents (RAG)
   │  readDocument       reads a document part by part, in order
   │  summarizeDocument  map-reduce summary of a whole document
   │  extractData        structured JSON extraction with a Zod schema
@@ -104,14 +105,22 @@ Browser shows the answer, the agent steps, tables, and Download buttons
 
 Scanned PDFs (images of text, no selectable text) are detected and the user is asked to upload them as images instead, so a vision model can read them.
 
-### Large documents (RAG)
+### Large documents (RAG with Supabase pgvector)
 1. **Chunking**: the text is split into parts of about 1,200 characters with a 150-character overlap, cutting at line breaks when possible.
-2. **Embeddings**: each part is turned into a vector with `text-embedding-3-small`, in batches.
-3. **Storage**: each document gets its own folder in **Vercel Blob**: the original file, `content.json` (the parts) and `vectors.json` (the embeddings).
-4. **Retrieval**: `searchDocuments` embeds the question and ranks all parts by **cosine similarity**, then returns the 8 best passages. If embeddings are unavailable, it falls back to keyword matching.
+2. **Embeddings**: each part is turned into a vector of 512 numbers with `text-embedding-3-small`, in batches.
+3. **Vector store**: every part is saved as a row in a **Supabase (Postgres) table with a pgvector column** (`document_chunks`: document URL, name, part number, text, embedding). The original file and the full text are kept in **Vercel Blob**.
+4. **Hybrid retrieval**: `searchDocuments` embeds the question and calls a Postgres function (`match_document_chunks`) that scores every part of the chat's documents by
+   - **meaning**: cosine similarity computed by pgvector (70%), and
+   - **exact words**: Postgres full-text search, where **rare words count more** than common ones (30%).
+
+   The model sends **2–4 phrasings** of each question (the user's words plus the formal terms a document would use, e.g. "bring my dog" → "pets policy"). The ranked lists are merged with **reciprocal rank fusion**, so passages that rank high for several phrasings win, and the 8 best passages are returned to the model.
 5. **Summaries**: `summarizeDocument` splits the document into up to 12 sections, summarizes them **in parallel**, then combines the section summaries (**map-reduce**).
 
-The project brief suggests a vector store such as Supabase pgvector. Because each chat only searches its own few documents (hundreds to a few thousand parts), the vectors are stored as JSON next to the document in Vercel Blob and searched on the server. This needs **no extra database or account**, and keeps everything in the existing Vercel project. A real vector database would be the next step for many users or very large collections (see limitations).
+**Why hybrid search?** The test handbook repeats the same template sentence on almost every page, with a few real facts hidden among them. A passage that is mostly filler with one important sentence (e.g. "the IT security hotline is extension 4477") gets a vector very similar to all the filler passages, so pure vector search missed it. Adding keyword scoring, with extra weight for rare words like "hotline", ranks the right passage first, and multiple phrasings handle questions asked in everyday words ("my account was hacked" vs. "IT security hotline"). The model is also told to search again with other words before concluding that a document doesn't contain something.
+
+**Backup:** a copy of the vectors is also saved in Blob. If Supabase isn't configured or is unavailable, the same hybrid search runs on the server with the Blob copy, and if embeddings fail, it falls back to keyword search. The search line in the chat shows which method was used.
+
+The database setup (table, security and search function) is in [`supabase/setup.sql`](supabase/setup.sql).
 
 ### Structured output
 `extractData` builds a **Zod schema at runtime** from the fields the model asks for (name + type: string, number or boolean), then calls the model with `Output.object({ schema })`. The AI SDK validates the response against the schema, so the app always receives well-formed JSON.
@@ -147,8 +156,8 @@ The same applies to images and documents. For example, a question about the hand
 - **Vercel AI SDK** (`ai`, `@ai-sdk/react`) with the **OpenRouter provider**, **Zod** for tool schemas and structured outputs
 - **Parsing**: `unpdf`, `mammoth`, `exceljs`
 - **File generation**: `docx`, `pdf-lib`, `exceljs`
-- **Embeddings** via the OpenRouter embeddings API
-- **Vercel Blob** for images, documents, indexes and generated files
+- **Embeddings** via the OpenRouter embeddings API, stored in **Supabase** (Postgres + **pgvector**)
+- **Vercel Blob** for images, documents, extracted text and generated files
 - **Vercel** (Hobby plan) for hosting
 - **localStorage** for conversations
 
@@ -166,13 +175,16 @@ The same applies to images and documents. For example, a question about the hand
    npm install
    ```
 3. **Create a Vercel Blob store** (Vercel → Storage → Create → Blob, **public** access) and copy its read-write token.
-4. **Add your keys.** Copy `.env.example` to `.env.local` and fill in:
+4. **Create a Supabase project** (supabase.com → New project). In the **SQL Editor**, paste and run [`supabase/setup.sql`](supabase/setup.sql). This creates the `document_chunks` table, turns on Row Level Security, and creates the search function. Then copy the project URL and a **secret key** (Project Settings → API Keys).
+5. **Add your keys.** Copy `.env.example` to `.env.local` and fill in:
    ```
    OPENROUTER_API_KEY=your-openrouter-key
    BLOB_READ_WRITE_TOKEN=your-blob-token
+   SUPABASE_URL=https://your-project.supabase.co
+   SUPABASE_SECRET_KEY=your-supabase-secret-key
    ```
-   `.env.local` is git-ignored and never committed. The same OpenRouter key is used for chat, images and embeddings.
-5. **Start the dev server**
+   `.env.local` is git-ignored and never committed. The same OpenRouter key is used for chat, images and embeddings. Supabase is optional: without it, the app uses the Blob backup for search.
+6. **Start the dev server**
    ```bash
    npm run dev
    ```
@@ -182,12 +194,14 @@ The same applies to images and documents. For example, a question about the hand
 1. Import the GitHub repo at vercel.com/new.
 2. Add `OPENROUTER_API_KEY` under **Environment Variables**.
 3. Create a **Blob** store under **Storage** and connect it to the project. This adds `BLOB_READ_WRITE_TOKEN`.
-4. Deploy. Every push to `main` redeploys automatically, and other branches get preview deployments.
+4. Add `SUPABASE_URL` and `SUPABASE_SECRET_KEY` under **Environment Variables**.
+5. Deploy. Every push to `main` redeploys automatically, and other branches get preview deployments.
 
 ---
 
 ## Security
 - API keys are **only** used in server code (`app/api/*/route.ts` and the `lib` files they call). They're stored in `.env.local` locally (git-ignored) and as **Vercel Environment Variables** in production. They never appear in the repository or in client-side code.
+- The Supabase **secret key** is only used on the server. The `document_chunks` table has **Row Level Security** turned on with no public policies, and the search function can only be run by the server role, so the public/anonymous key can't read anything.
 - The server only accepts **chat models from an allow-list**.
 - Uploads are checked server-side: allowed types only, max 4 MB per file.
 - The server only downloads files from **our own Blob storage**.
@@ -202,9 +216,11 @@ The same applies to images and documents. For example, a question about the hand
 - **Old formats** (.doc, .xls, .ppt) and PowerPoint files aren't supported.
 - **Generated PDFs use standard fonts**, so only Latin characters are supported (Arabic text, for example, is replaced by "?"). Word and Excel files support all languages.
 - **Generated files are rebuilt from text**: an "edited" Word or PDF file is a new file with the same content and changes, not the original layout, fonts or images.
-- **Vector search runs in the app** (vectors stored as JSON in Blob) rather than in a vector database. This is fine for a few documents per chat, but wouldn't scale to thousands of documents shared across users.
+- **Search is limited to the documents of the current chat**; there's no search across all past documents yet.
+- **No approximate vector index** (HNSW): each search compares the question with every part of the chat's documents, which is exact and fast for a few documents but would need an index for very large collections.
+- **Stored data isn't deleted** when a chat is deleted (Blob files and Supabase rows stay).
 - **Summaries of very large documents** take 20–40 seconds and must finish within Vercel's 60-second limit; extremely long documents may hit it.
-- **Search can miss information** that is phrased very differently from the question; the model can then read the document part by part.
+- **Search can still miss information** that is phrased very differently from the question; the model is told to search again with other words or read the document part by part. Keyword matching works best in English.
 - **Image generation is slower** (often 10–30 s) and can occasionally fail. The app retries once and shows the reason if it still fails.
 - **Text-only models** (Llama 3.3) can't see images, only a note that an image was shared. They can use documents normally.
 - **Simple history trimming** (last 20 messages); token-based trimming would be more precise.

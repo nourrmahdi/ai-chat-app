@@ -3,6 +3,7 @@ import { extractText, getDocumentProxy } from "unpdf";
 import mammoth from "mammoth";
 import ExcelJS from "exceljs";
 import { extensionOf, type FileKind } from "@/lib/files";
+import { matchChunks, storeChunks, vectorStoreEnabled } from "@/lib/vector-store";
 
 // Server-only helpers for documents: parsing, chunking, embeddings (RAG) and storage in Vercel Blob.
 
@@ -191,19 +192,33 @@ export async function saveDocument(file: File, kind: FileKind) {
 
   // Embeddings are optional: if they fail, search falls back to keyword matching
   let embedded = false;
+  let vectorStore: "pgvector" | "blob" | "none" = "none";
   try {
     const vectors = await embedTexts(chunks);
+    embedded = true;
+
+    // 1. Main vector store: Supabase pgvector
+    if (vectorStoreEnabled()) {
+      try {
+        await storeChunks(original.url, file.name, chunks, vectors);
+        vectorStore = "pgvector";
+      } catch (err) {
+        console.error("Supabase failed, vectors will be kept in Blob instead:", err);
+      }
+    }
+
+    // 2. Backup copy in Blob, so search still works if Supabase is unavailable
     await put(`${folder}/vectors.json`, JSON.stringify(vectors), {
       access: "public",
       addRandomSuffix: false,
       contentType: "application/json",
     });
-    embedded = true;
+    if (vectorStore === "none") vectorStore = "blob";
   } catch (err) {
     console.error("Embedding failed, keyword search will be used instead:", err);
   }
 
-  return { url: original.url, chars: text.length, pages, chunks: chunks.length, truncated, embedded };
+  return { url: original.url, chars: text.length, pages, chunks: chunks.length, truncated, embedded, vectorStore };
 }
 
 const BLOB_HOST = /\.public\.blob\.vercel-storage\.com$/;
@@ -235,7 +250,8 @@ async function loadVectors(fileUrl: string) {
 
 // ---------- 5. Retrieval (the "R" in RAG) ----------
 
-export type SearchHit = { document: string; chunk: number; score: number; text: string };
+export type SearchMethod = "pgvector" | "blob vectors" | "keywords";
+export type SearchHit = { document: string; chunk: number; score: number; text: string; method: SearchMethod };
 
 export async function searchDocuments(
   docs: { url: string; name: string }[],
@@ -248,24 +264,61 @@ export async function searchDocuments(
   } catch {
     queryVector = null;
   }
-  const words = query.toLowerCase().split(/\W+/).filter((w) => w.length > 2);
+  const STOP_WORDS = new Set(["the", "and", "for", "are", "what", "how", "many", "much", "does", "with", "this", "that", "from", "about", "which", "who", "when", "where", "why", "can", "you", "our", "their", "there", "into"]);
+  const words = query.toLowerCase().split(/\W+/).filter((w) => w.length > 1 && !STOP_WORDS.has(w));
 
   const hits: SearchHit[] = [];
   for (const doc of docs) {
+    // 1. Supabase pgvector (documents uploaded while Supabase was configured)
+    if (queryVector && vectorStoreEnabled()) {
+      try {
+        const matches = await matchChunks(queryVector, query, doc.url, topK);
+        if (matches.length) {
+          for (const m of matches) {
+            hits.push({ document: m.document_name, chunk: m.chunk_index, score: m.similarity, text: m.content, method: "pgvector" });
+          }
+          continue;
+        }
+      } catch (err) {
+        console.error("Supabase search failed, using Blob vectors instead:", err);
+      }
+    }
+
+    // 2. Fallback: vectors stored in Blob, or keyword matching
     const content = await loadContent(doc.url);
     if (!content) continue;
     const vectors = queryVector ? await loadVectors(doc.url) : null;
 
+    // Which question words appear in each chunk. Short words ("IT") must match a whole word;
+    // longer ones may match inside a word ("laptop" in "laptops").
+    const matches = content.chunks.map((text) => {
+      const lower = text.toLowerCase();
+      const chunkWords = new Set(lower.split(/\W+/));
+      return words.filter((w) => (w.length < 4 ? chunkWords.has(w) : lower.includes(w)));
+    });
+    // Rare words (e.g. "hotline") count more than words found everywhere (e.g. "policy")
+    const weight = new Map(
+      words.map((w) => {
+        const found = matches.filter((m) => m.includes(w)).length;
+        return [w, Math.max(Math.log(content.chunks.length / (1 + found)) + 1, 0)];
+      })
+    );
+    const keywordScores = matches.map((m) => m.reduce((sum, w) => sum + (weight.get(w) ?? 0), 0));
+    const bestKeywordScore = Math.max(...keywordScores, 0) || 1;
+
     content.chunks.forEach((text, i) => {
+      const keywordScore = keywordScores[i] / bestKeywordScore; // 0 to 1
       let score: number;
+      let method: SearchMethod;
       if (queryVector && vectors?.[i]) {
-        score = similarity(queryVector, vectors[i]);
+        // Hybrid: 70% meaning + 30% exact words (same formula as the Supabase search)
+        score = 0.7 * similarity(queryVector, vectors[i]) + 0.3 * keywordScore;
+        method = "blob vectors";
       } else {
-        // Fallback: count matching words
-        const lower = text.toLowerCase();
-        score = words.reduce((sum, w) => sum + (lower.includes(w) ? 1 : 0), 0) / (words.length || 1);
+        score = keywordScore;
+        method = "keywords";
       }
-      hits.push({ document: content.name, chunk: i, score, text });
+      hits.push({ document: content.name, chunk: i, score, text, method });
     });
   }
   return hits.sort((a, b) => b.score - a.score).slice(0, topK);

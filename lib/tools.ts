@@ -59,16 +59,40 @@ export function buildTools(docs: ChatDocument[]) {
     // ---------- Documents: retrieval (RAG) ----------
     searchDocuments: tool({
       description:
-        "Semantic search inside the uploaded documents. Use it to answer questions about large documents: it returns the most relevant passages.",
+        "Hybrid search (meaning + keywords) inside the uploaded documents. Use it to answer questions about large documents: it returns the most relevant passages. Always give several phrasings of what you're looking for.",
       inputSchema: z.object({
-        query: z.string().describe("What to look for, phrased as a question or keywords."),
+        queries: z
+          .array(z.string())
+          .min(2)
+          .max(4)
+          .describe(
+            "2 to 4 different phrasings: the user's own words, synonyms, and the formal terms a document would likely use. Example: 'can I bring my dog to work' -> ['bring dog to work', 'pets policy', 'animals in the office']."
+          ),
         documents: z.array(z.string()).optional().describe("Names of documents to search. Leave empty to search all."),
       }),
-      execute: async ({ query, documents }) => {
+      execute: async ({ queries, documents }) => {
         const selected = documents?.length ? documents.map((d) => findDoc(d)) : docs;
-        const hits = await searchDocuments(selected, query, 8);
+
+        // Multi-query search with rank fusion (RRF): every phrasing gives a ranked list, and a passage
+        // scores 1/(60 + rank) in each list. Passages that rank high for several phrasings win.
+        const perQuery = await Promise.all(queries.map((q) => searchDocuments(selected, q, 20)));
+        const fused = new Map<string, { hit: (typeof perQuery)[number][number]; score: number }>();
+        for (const list of perQuery) {
+          list.forEach((hit, rank) => {
+            const key = `${hit.document}#${hit.chunk}`;
+            const entry = fused.get(key) ?? { hit, score: 0 };
+            entry.score += 1 / (60 + rank + 1);
+            fused.set(key, entry);
+          });
+        }
+        const hits = [...fused.values()]
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 8)
+          .map(({ hit, score }) => ({ ...hit, score: score * 60 })); // about 1 = top of one list
+
         return {
-          query,
+          query: queries.join(" · "),
+          searchedWith: [...new Set(hits.map((h) => h.method))].join(" + ") || "nothing found",
           results: hits.map((h) => ({
             document: h.document,
             part: h.chunk + 1,

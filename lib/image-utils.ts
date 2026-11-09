@@ -49,6 +49,7 @@ export type UploadedDocument = {
   chunks: number;
   truncated: boolean;
   embedded: boolean;
+  vectorStore?: "pgvector" | "blob" | "none";
 };
 
 // Sends one document to our /api/files route, which parses, indexes and stores it

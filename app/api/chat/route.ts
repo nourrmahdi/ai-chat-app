@@ -23,6 +23,9 @@ export const maxDuration = 60;
 // Only the most recent messages are sent, so long chats don't exceed the context window
 const MAX_MESSAGES = 20;
 
+// Maximum model steps per answer (each tool call + the final reply is one step)
+const MAX_STEPS = 6;
+
 // Documents up to this size are put directly into the prompt; bigger ones are used through tools (RAG)
 const INLINE_DOC_CHARS = 30_000;
 const INLINE_TOTAL_CHARS = 60_000;
@@ -38,6 +41,8 @@ IMAGES
 
 DOCUMENTS
 - Uploaded documents appear as "[Document: ...]" notes. Small documents include their full text. Large documents don't fit: use searchDocuments to find relevant passages, readDocument to read parts in order, and summarizeDocument to summarize a whole document.
+- Users often ask in everyday words while documents use formal terms. When you call searchDocuments, always pass several phrasings: the user's words plus the formal terms a document would use.
+- If a search doesn't find what you need, search again with different, shorter keywords (synonyms, the exact terms the document might use) before concluding that the document doesn't contain it. Don't read a large document from the beginning to look for one fact: use readDocument only near a part that a search found. You have a limited number of steps, so always finish with an answer.
 - Base your answers on the documents and mention which document (and page or part) information comes from. If the documents don't contain the answer, say so.
 - To compare documents, read or search each of them, then compare.
 - For any calculation on Excel or CSV data (totals, averages, counts, min/max, per group), call analyzeTable and use its exact results. Never add up or average numbers yourself, and copy its numbers exactly into answers and files.
@@ -172,7 +177,9 @@ export async function POST(req: Request) {
     instructions: instructions(docs),
     messages: await convertToModelMessages(history),
     tools,
-    stopWhen: stepCountIs(6), // allow multi-step work: search → read → create a file → reply
+    stopWhen: stepCountIs(MAX_STEPS), // allow multi-step work: search → read → create a file → reply
+    // On the last step, tools are turned off so the model always finishes with a written answer
+    prepareStep: ({ stepNumber }) => (stepNumber >= MAX_STEPS - 1 ? { toolChoice: "none" } : undefined),
     temperature: 0.7,
     maxOutputTokens: 4000, // file contents are written by the model, so allow longer answers
   });

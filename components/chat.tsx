@@ -160,7 +160,7 @@ export function Chat({ id, initialMessages, model, onModelChange, onSave, header
             mediaType: u.mediaType,
             info: [
               u.pages ? `${u.pages} pages` : `${Math.round(u.chars / 1000)}k characters`,
-              u.embedded ? "indexed" : "keyword search only",
+              u.vectorStore === "pgvector" ? "indexed in pgvector" : u.embedded ? "indexed" : "keyword search only",
               u.truncated ? "very large: partly indexed" : "",
             ]
               .filter(Boolean)
@@ -356,7 +356,9 @@ export function Chat({ id, initialMessages, model, onModelChange, onSave, header
                     return (
                       <ToolStep key={i} icon={<Search className="size-3.5" />} done={part.state === "output-available"}>
                         {part.state === "output-available"
-                          ? `Searched documents for “${part.output.query}” · ${part.output.results.length} passages found`
+                          ? `Searched documents for “${part.output.query}” · ${part.output.results.length} passages found${
+                              part.output.searchedWith ? ` · ${part.output.searchedWith}` : ""
+                            }`
                           : "Searching documents…"}
                       </ToolStep>
                     );
