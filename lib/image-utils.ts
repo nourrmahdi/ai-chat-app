@@ -1,4 +1,4 @@
-// Browser-only helpers for preparing images before upload.
+// Browser-only helpers for preparing images and documents before upload.
 
 const MAX_SIDE = 1600; // longest side in pixels
 const RESIZE_ABOVE_BYTES = 1.5 * 1024 * 1024;
@@ -30,7 +30,6 @@ export type UploadedImage = { url: string; mediaType: string; filename: string }
 
 // Sends one image to our /api/upload route, which stores it in Vercel Blob
 export async function uploadImage(file: File): Promise<UploadedImage> {
-
   const prepared = await shrinkImage(file);
   const form = new FormData();
   form.append("file", prepared);
@@ -39,4 +38,26 @@ export async function uploadImage(file: File): Promise<UploadedImage> {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error ?? "Upload failed.");
   return data as UploadedImage;
+}
+
+export type UploadedDocument = {
+  url: string;
+  mediaType: string;
+  filename: string;
+  chars: number;
+  pages?: number;
+  chunks: number;
+  truncated: boolean;
+  embedded: boolean;
+};
+
+// Sends one document to our /api/files route, which parses, indexes and stores it
+export async function uploadDocument(file: File): Promise<UploadedDocument> {
+  const form = new FormData();
+  form.append("file", file);
+
+  const res = await fetch("/api/files", { method: "POST", body: form });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error ?? "Upload failed.");
+  return data as UploadedDocument;
 }

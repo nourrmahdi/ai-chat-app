@@ -28,6 +28,9 @@ export const IMAGE_MODEL = {
   provider: "Google",
 };
 
+// Fast model with a huge context window, used behind the scenes for summaries and data extraction
+export const WORKER_MODEL = "google/gemini-2.5-flash";
+
 export const DEFAULT_MODEL = MODELS[0].id;
 
 export function getModel(id?: string) {

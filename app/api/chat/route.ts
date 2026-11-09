@@ -5,55 +5,59 @@ import {
   createUIMessageStreamResponse,
   isToolUIPart,
   stepCountIs,
-  tool,
   APICallError,
   type UIMessage,
 } from "ai";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
-import { z } from "zod";
 import { MODELS, getModel } from "@/lib/models";
-import { generateAndStoreImage } from "@/lib/generate-image";
+import { buildTools, type ChatDocument } from "@/lib/tools";
+import { loadContent } from "@/lib/documents";
 
 const openrouter = createOpenRouter({
   apiKey: process.env.OPENROUTER_API_KEY,
 });
 
-// Image generation can take 10–30 seconds, so allow longer requests
+// Images, long documents and file generation can take a while
 export const maxDuration = 60;
 
 // Only the most recent messages are sent, so long chats don't exceed the context window
 const MAX_MESSAGES = 20;
 
-const INSTRUCTIONS = `You are a helpful assistant in a chat app that supports images.
+// Documents up to this size are put directly into the prompt; bigger ones are used through tools (RAG)
+const INLINE_DOC_CHARS = 30_000;
+const INLINE_TOTAL_CHARS = 60_000;
+
+function instructions(docs: ChatDocument[]) {
+  return `You are a helpful assistant in a chat app that supports images and files.
 - Use Markdown formatting when it helps.
+
+IMAGES
 - You can create images with the generateImage tool. Call it whenever the user asks you to create, draw, design, generate, edit, change, restyle, regenerate or make a variation of an image. Never say you can't make images.
-- To edit an existing image, make a variation, or use an image as a reference, pass its URL in referenceImageUrls. Image URLs appear in the conversation as "[Image URL: ...]" notes or in earlier generateImage results.
-- Write rich prompts for the image model: subject, style, composition, colors, lighting. For edits, describe the full desired result, not just the change.
-- The app shows generated images automatically. Don't repeat their URLs or embed them as Markdown. After generating, add one short sentence about the result.`;
+- To edit an existing image, make a variation, or use an image as a reference, pass its URL in referenceImageUrls. Image URLs appear as "[Image URL: ...]" notes or in earlier generateImage results.
+- Write rich prompts for the image model. The app shows generated images automatically: don't repeat their URLs.
 
+DOCUMENTS
+- Uploaded documents appear as "[Document: ...]" notes. Small documents include their full text. Large documents don't fit: use searchDocuments to find relevant passages, readDocument to read parts in order, and summarizeDocument to summarize a whole document.
+- Base your answers on the documents and mention which document (and page or part) information comes from. If the documents don't contain the answer, say so.
+- To compare documents, read or search each of them, then compare.
+- For any calculation on Excel or CSV data (totals, averages, counts, min/max, per group), call analyzeTable and use its exact results. Never add up or average numbers yourself, and copy its numbers exactly into answers and files.
+- Use extractData to pull structured data (invoice fields, tables, lists) as validated JSON, and set saveAs when the user wants a spreadsheet or JSON file.
+- Use createFile whenever the user wants a file (Word, PDF, Excel, CSV, Markdown, code), including an edited version of an uploaded file: read it first, then write the complete new content. The app shows a download button automatically: don't repeat file URLs.
+${docs.length ? `\nDocuments in this chat: ${docs.map((d) => `"${d.name}"`).join(", ")}` : ""}`;
+}
 
-// The tool the chat model can decide to call
-const tools = {
-  generateImage: tool({
-    description:
-      "Generate a new image from a text description, or edit / create a variation of existing images by passing them as references.",
-    inputSchema: z.object({
-      prompt: z
-        .string()
-        .describe("Detailed description of the image to create, or of the final result after an edit."),
-      referenceImageUrls: z
-        .array(z.string())
-        .max(3)
-        .optional()
-        .describe("URLs of existing images to edit, vary, or use as a style/content reference."),
-      aspectRatio: z
-        .enum(["1:1", "16:9", "9:16", "4:3", "3:4"])
-        .optional()
-        .describe("Image shape. Leave empty for square."),
-    }),
-    execute: async (input) => generateAndStoreImage(input),
-  }),
-};
+// All documents uploaded anywhere in the chat (even older messages), so tools can always use them
+function collectDocuments(messages: UIMessage[]): ChatDocument[] {
+  const docs: ChatDocument[] = [];
+  for (const m of messages) {
+    for (const part of m.parts) {
+      if (part.type === "file" && !part.mediaType.startsWith("image") && !docs.some((d) => d.url === part.url)) {
+        docs.push({ url: part.url, name: part.filename ?? "document" });
+      }
+    }
+  }
+  return docs;
+}
 
 // Only images from our own Blob storage are downloaded by the server
 const BLOB_HOST = /\.public\.blob\.vercel-storage\.com$/;
@@ -63,7 +67,6 @@ const BLOB_HOST = /\.public\.blob\.vercel-storage\.com$/;
 async function toDataUrl(url: string): Promise<string> {
   try {
     const parsed = new URL(url);
-
     if (parsed.protocol !== "https:" || !BLOB_HOST.test(parsed.hostname)) return url;
     const res = await fetch(url);
     if (!res.ok) return url;
@@ -77,40 +80,56 @@ async function toDataUrl(url: string): Promise<string> {
 
 // Adapt the history to what the chosen model can handle
 async function prepareMessages(messages: UIMessage[], canSeeImages: boolean): Promise<UIMessage[]> {
-  return Promise.all(
-    messages.map(async (message) => ({
-      ...message,
-      parts: (
-        await Promise.all(
-          message.parts.map(async (part): Promise<UIMessage["parts"]> => {
-            // Drop unfinished tool calls (for example if the user pressed Stop)
-            if (isToolUIPart(part) && part.state !== "output-available" && part.state !== "output-error") {
-              return [];
-            }
+  let inlineBudget = INLINE_TOTAL_CHARS;
 
-            if (part.type !== "file" || !part.mediaType.startsWith("image")) return [part];
+  const prepared: UIMessage[] = [];
+  for (const message of messages) {
+    const parts: UIMessage["parts"] = [];
+    for (const part of message.parts) {
+      // Drop unfinished tool calls (for example if the user pressed Stop)
+      if (isToolUIPart(part) && part.state !== "output-available" && part.state !== "output-error") continue;
 
-            if (canSeeImages) {
-              // Send the image itself (base64) + its URL as text, so the model can reference it in tool calls
-              return [
-                { ...part, url: await toDataUrl(part.url) },
-                { type: "text", text: `[Image URL: ${part.url}]` },
-              ];
+      if (part.type !== "file") {
+        parts.push(part);
+        continue;
+      }
 
-            }
+      // ----- Documents: send their text (small ones) or a note (large ones) -----
+      if (!part.mediaType.startsWith("image")) {
+        const content = await loadContent(part.url).catch(() => null);
+        const name = part.filename ?? "document";
+        if (!content) {
+          parts.push({ type: "text", text: `[Document: "${name}" could not be loaded.]` });
+        } else if (content.chars <= INLINE_DOC_CHARS && content.chars <= inlineBudget) {
+          inlineBudget -= content.chars;
+          parts.push({
+            type: "text",
+            text: `[Document: "${name}" (${content.chars.toLocaleString()} characters${content.pages ? `, ${content.pages} pages` : ""}), full text:]\n${content.chunks.join("\n")}\n[End of "${name}"]`,
+          });
+        } else {
+          parts.push({
+            type: "text",
+            text: `[Document: "${name}" — large document (${content.chars.toLocaleString()} characters${content.pages ? `, ${content.pages} pages` : ""}, ${content.chunks.length} parts${content.truncated ? ", only the beginning was indexed" : ""}). It does not fit in the context: use searchDocuments, readDocument or summarizeDocument.]`,
+          });
+        }
+        continue;
+      }
 
-            // Text-only model: replace the image with a note so the context still makes sense
-            return [
-              {
-                type: "text",
-                text: `[The user attached an image${part.filename ? ` "${part.filename}"` : ""}, but the current model cannot view images. If asked about it, suggest switching to a vision model. Image URL: ${part.url}]`,
-              },
-            ];
-          })
-        )
-      ).flat(),
-    }))
-  );
+      // ----- Images -----
+      if (canSeeImages) {
+        // Send the image itself (base64) + its URL as text, so the model can reference it in tool calls
+        parts.push({ ...part, url: await toDataUrl(part.url) }, { type: "text", text: `[Image URL: ${part.url}]` });
+      } else {
+        // Text-only model: replace the image with a note so the context still makes sense
+        parts.push({
+          type: "text",
+          text: `[The user attached an image${part.filename ? ` "${part.filename}"` : ""}, but the current model cannot view images. If asked about it, suggest switching to a vision model. Image URL: ${part.url}]`,
+        });
+      }
+    }
+    prepared.push({ ...message, parts });
+  }
+  return prepared;
 }
 
 // Turn technical errors into clear messages for the user
@@ -121,15 +140,15 @@ function friendlyError(error: unknown): string {
     if (error.statusCode === 429) return "Rate limit reached for this model. Wait a moment and retry, or switch models.";
     if (error.statusCode === 402) return "The API key has run out of credits.";
     if (error.statusCode === 401) return "The server's API key is invalid.";
-    if (error.statusCode === 413) return "The request is too large. Try fewer or smaller images.";
+    if (error.statusCode === 413) return "The request is too large. Try fewer or smaller files.";
     if (error.statusCode && error.statusCode >= 500) return "The model provider is having problems. Retry or switch models.";
   }
 
   if (/no endpoints|not found/i.test(message)) return "This model is currently unavailable. Please pick another one.";
+  if (/context|too long|maximum.*tokens/i.test(message)) return "The conversation is too long for this model. Start a new chat or pick a model with a bigger context.";
   if (/image/i.test(message) && /support/i.test(message)) return "This model can't read images. Please switch to a vision model.";
 
   return message || "Something went wrong. Please try again.";
-
 }
 
 export async function POST(req: Request) {
@@ -143,17 +162,19 @@ export async function POST(req: Request) {
     return new Response("The server is missing its API key.", { status: 500 });
   }
 
+  const docs = collectDocuments(messages);
+  const tools = buildTools(docs);
   const canSeeImages = getModel(model)?.vision ?? false;
   const history = await prepareMessages(messages.slice(-MAX_MESSAGES), canSeeImages);
 
   const result = streamText({
     model: openrouter(model),
-    instructions: INSTRUCTIONS,
+    instructions: instructions(docs),
     messages: await convertToModelMessages(history),
     tools,
-    stopWhen: stepCountIs(3), // allow: call the tool → read the result → reply
+    stopWhen: stepCountIs(6), // allow multi-step work: search → read → create a file → reply
     temperature: 0.7,
-    maxOutputTokens: 1000,
+    maxOutputTokens: 4000, // file contents are written by the model, so allow longer answers
   });
 
   return createUIMessageStreamResponse({
@@ -162,7 +183,6 @@ export async function POST(req: Request) {
       tools,
       // Attach the model name to each reply so the UI can label it
       messageMetadata: ({ part }) => (part.type === "start" ? { model } : undefined),
-
       onError: friendlyError,
     }),
   });
