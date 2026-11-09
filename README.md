@@ -1,6 +1,6 @@
-# AI Chat – Multi-Model & Multimodal Chat App
+# AI Chat – Multi-Model Chat with Images and Files
 
-A chat application connected to many LLM providers through **OpenRouter**. You can switch models **in the middle of a conversation** without losing context, upload images for the AI to analyze, and ask it to **create and edit images**. The chat model decides by itself when to generate an image, using **tool calling**.
+A chat application connected to many LLM providers through **OpenRouter**. You can switch models **in the middle of a conversation** without losing context, upload images for the AI to analyze, ask it to **create and edit images**, and upload **documents** (PDF, Word, Excel/CSV, code, text) to ask questions about them, summarize and compare them, **extract structured data**, and get back **generated or edited files** to download. The chat model decides by itself which tools to use, through **tool calling**.
 
 **Live demo:** https://ai-chat-app-six-bice.vercel.app
 
@@ -15,22 +15,31 @@ A chat application connected to many LLM providers through **OpenRouter**. You c
 - **Model label on every reply**, showing which model produced it
 - **Markdown and code-block rendering**
 - **Conversation management**: create, rename, delete, and reopen chats (saved in browser `localStorage`)
-- **Error handling**: clear messages for rate limits, unavailable models, missing credits, and provider errors, with **Retry** and **Stop** buttons
+- **Error handling**: clear messages for rate limits, unavailable models, missing credits, too-long conversations, and provider errors, with **Retry** and **Stop** buttons
 - **Context trimming**: only the last 20 messages are sent
-- **Generation parameters**: temperature 0.7, max 1,000 output tokens per reply
+- **Generation parameters**: temperature 0.7, max 4,000 output tokens per reply (raised from 1,000 so the model can write whole files)
 - **Responsive UI** (slide-out sidebar on mobile) with **light and dark mode**
 
 ### Images (Project 3)
-- **Image upload** by **drag-and-drop**, **paste (Ctrl + V)**, or **file picker**, with **previews** and upload spinners (up to 4 images per message)
+- **Image upload** by **drag-and-drop**, **paste (Ctrl + V)**, or **file picker**, with **previews** and upload spinners
 - **Image understanding** with vision models: description, analysis, **text extraction (OCR)**, questions about an image, and **comparing several images**
-- **Image generation from text** ("Draw a cat astronaut on the moon")
-- **Image generation from a reference image** ("Turn this photo into a winter scene")
-- **Edit**, **Regenerate**, and **Variation** buttons on every generated image
-- **Download** button for generated images
-- **Tool calling**: the chat model decides on its own when to call the `generateImage` tool, so there's no separate "image mode"
-- **Capability detection**: the model list shows which models are **vision** or **text only**. When a text-only model is selected, images are replaced by a text note, so the conversation still works, and the UI shows a warning
-- **Loading states** for slower requests ("Generating image…", upload spinners)
+- **Image generation** from text or from a reference image, with **Edit**, **Regenerate**, **Variation**, and **Download** buttons
+- **Capability detection**: the model list shows which models are **vision** or **text only**; text-only models get a text note instead of the image
 - **Large images are shrunk in the browser** (max 1600 px) before upload
+
+### Files and documents (Project 4)
+- **Upload documents** with the same paperclip, drag-and-drop, or paste: **PDF**, **Word (.docx)**, **Excel (.xlsx)**, **CSV**, **code files** (.py, .js, .ts, .java, .c, .cpp, .sql, .json, …) and **text / Markdown**. Images and documents can be mixed in the same message.
+- **Parsing on upload**: the text is extracted (PDF pages are labeled, Word headings, lists and tables keep their structure, every Excel sheet is read), split into parts, and indexed. The upload chip shows e.g. "184 pages · indexed".
+- **Ask questions** about one or several documents. Answers name the document and section they come from, and the model says so when the documents don't contain the answer.
+- **Summarize** any document, including documents far bigger than the model's context.
+- **Compare** several documents in one question.
+- **Structured extraction** (`extractData`): the model chooses the fields, and a **Zod schema** built from them forces the output to be valid JSON. The result is shown as a table, with the raw JSON, and can be saved as **Excel, CSV or JSON**.
+- **Exact spreadsheet calculations** (`analyzeTable`): totals, averages, counts, min and max, filtered and grouped (e.g. "revenue per region"), computed **in code** on the real file instead of by the model, so numbers are always correct. Results can be saved as Excel or CSV.
+- **File generation with download** (`createFile`): **Word (.docx)**, **PDF**, **Excel (.xlsx)**, **CSV**, **Markdown**, **text** and **code** files, with headings, bullet points, bold text and tables.
+- **Edited files**: ask for changes to an uploaded file (e.g. "fix the bug in this script", "rewrite this report more formally") and get the new version back as a file.
+- **Large documents** are handled with **RAG** (embeddings + semantic search), **part-by-part reading**, and **map-reduce summaries**, so a 184-page PDF (~160k tokens) works even with GPT-4o mini (128K context).
+- **Visible agent steps**: the chat shows what the model did, e.g. "Searched documents for 'vacation days' · 8 passages found" or "Summarized 'handbook.pdf' in 12 sections".
+- **Works across models**: documents stay in the conversation when switching models, and even the **text-only Llama** model can use them, because models receive text, not the original file.
 
 ---
 
@@ -45,43 +54,80 @@ A chat application connected to many LLM providers through **OpenRouter**. You c
 | Llama 3.3 70B Instruct | Meta | `meta-llama/llama-3.3-70b-instruct` | ❌ text only |
 | Mistral Small 3.2 24B | Mistral | `mistralai/mistral-small-3.2-24b-instruct` | ✅ |
 
-### Image-generation model (used by the tool)
-| Model | Provider | OpenRouter ID |
+All five can use documents and every tool.
+
+### Models used by the tools
+| Purpose | Model | OpenRouter ID |
 |---|---|---|
-| Gemini 2.5 Flash Image | Google | `google/gemini-2.5-flash-image` |
+| Image generation | Gemini 2.5 Flash Image | `google/gemini-2.5-flash-image` |
+| Embeddings (semantic search) | OpenAI text-embedding-3-small (512 dimensions) | `openai/text-embedding-3-small` |
+| Section summaries and structured extraction | Gemini 2.5 Flash | `google/gemini-2.5-flash` |
 
 ---
 
 ## How it works
 
 ```
-Browser (app/page.tsx, components/chat.tsx)
-  │  1. Images are shrunk and uploaded → /api/upload → Vercel Blob → public URL
-  │  2. The message (text + image URLs) and the full history are sent with the chosen model
+Browser (components/chat.tsx)
+  │  Images    → /api/upload → Vercel Blob
+  │  Documents → /api/files  → parse → split into parts → embeddings → Vercel Blob
+  │  The message (text + file URLs) and the full history are sent with the chosen model
   ▼
-/api/chat (server)                              ← API keys live only here
-  │  • Checks the model is allowed, trims the history
-  │  • Vision models: images are downloaded and sent as base64
-  │  • Text-only models: images are replaced by a text note
-  │  • Gives the model the generateImage tool
+/api/chat (server)                                   ← API keys live only here
+  │  • Small documents (≤ 30,000 characters): full text is put in the prompt
+  │  • Large documents: only a note, the model must use the document tools
+  │  • Images: base64 for vision models, a text note for text-only models
+  │  • Gives the model 7 tools and allows up to 6 steps per answer
   ▼
-Chat model (via OpenRouter)
-  │  Decides to answer with text, or to call generateImage(prompt, referenceImageUrls)
+Chat model (via OpenRouter) decides what to do, for example:
+  searchDocuments → readDocument → createFile → final answer
   ▼
-generateImage tool (server)
-  │  Calls Gemini 2.5 Flash Image with the prompt (+ reference images as base64)
-  │  Saves the result to Vercel Blob and returns its URL
+Tools (server, lib/tools.ts)
+  │  generateImage      image generation / editing (Project 3)
+  │  searchDocuments    semantic search over all documents in the chat (RAG)
+  │  readDocument       reads a document part by part, in order
+  │  summarizeDocument  map-reduce summary of a whole document
+  │  extractData        structured JSON extraction with a Zod schema
+  │  analyzeTable       exact totals / averages / counts on Excel and CSV
+  │  createFile         builds .docx / .pdf / .xlsx / .csv / .md / code → Blob
   ▼
-Chat model reads the tool result and writes a short reply
-  ▼
-Browser shows the image with Download / Edit / Regenerate / Variation buttons
+Browser shows the answer, the agent steps, tables, and Download buttons
 ```
 
-### Tool calling
-`generateImage` is defined with a **Zod schema** (`prompt`, optional `referenceImageUrls`, optional `aspectRatio`). The chat model receives the tool's description with every request and **decides by itself** when to use it. The result (image URL and prompt) is returned into the conversation, so later messages and other models keep that context. The Edit, Regenerate, and Variation buttons send normal chat messages, and the model calls the tool again with the right reference image.
+### Parsing
+| Format | Library | What is kept |
+|---|---|---|
+| PDF | `unpdf` | text of each page, labeled `[Page n]` |
+| Word (.docx) | `mammoth` | headings, lists, tables |
+| Excel (.xlsx) | `exceljs` | every sheet, every row (formula results, dates) |
+| CSV, code, text, Markdown | built in | the raw text (code is labeled with its language) |
 
-### Images: URLs vs base64
-Uploaded and generated images are stored in **Vercel Blob** and saved in the chat as **URLs**, so `localStorage` stays small. When a request is sent to a model, the server **downloads each image and sends it as base64**, because some providers (for example Google) can't fetch image URLs themselves.
+Scanned PDFs (images of text, no selectable text) are detected and the user is asked to upload them as images instead, so a vision model can read them.
+
+### Large documents (RAG)
+1. **Chunking**: the text is split into parts of about 1,200 characters with a 150-character overlap, cutting at line breaks when possible.
+2. **Embeddings**: each part is turned into a vector with `text-embedding-3-small`, in batches.
+3. **Storage**: each document gets its own folder in **Vercel Blob**: the original file, `content.json` (the parts) and `vectors.json` (the embeddings).
+4. **Retrieval**: `searchDocuments` embeds the question and ranks all parts by **cosine similarity**, then returns the 8 best passages. If embeddings are unavailable, it falls back to keyword matching.
+5. **Summaries**: `summarizeDocument` splits the document into up to 12 sections, summarizes them **in parallel**, then combines the section summaries (**map-reduce**).
+
+The project brief suggests a vector store such as Supabase pgvector. Because each chat only searches its own few documents (hundreds to a few thousand parts), the vectors are stored as JSON next to the document in Vercel Blob and searched on the server. This needs **no extra database or account**, and keeps everything in the existing Vercel project. A real vector database would be the next step for many users or very large collections (see limitations).
+
+### Structured output
+`extractData` builds a **Zod schema at runtime** from the fields the model asks for (name + type: string, number or boolean), then calls the model with `Output.object({ schema })`. The AI SDK validates the response against the schema, so the app always receives well-formed JSON.
+
+### Why calculations are done in code
+Language models often make mistakes when adding up many numbers. During testing, a model summing 60 spreadsheet rows "in its head" returned wrong totals. `analyzeTable` re-reads the original Excel/CSV file and calculates on the server, and the instructions tell every model to use it for any calculation.
+
+### File generation
+| Format | Library |
+|---|---|
+| Word (.docx) | `docx`: Markdown headings, bullets, bold/italic, tables |
+| PDF | `pdf-lib`: wrapped text, headings, bullets, tables, automatic page breaks |
+| Excel (.xlsx) | `exceljs`: bold header row, automatic column widths, numbers stored as numbers |
+| CSV, Markdown, text, code | plain text |
+
+Generated files are saved in Vercel Blob, and the chat shows a card with the file name, size, and a **Download** button.
 
 ---
 
@@ -91,15 +137,18 @@ Every request sends the **entire conversation** to the selected model. In the ex
 
 ![Context kept when switching models](docs/context-switch.png)
 
-The same applies to images: an image analyzed by one vision model can be discussed by another, and a text-only model (Llama 3.3) still knows an image was shared and what earlier replies said about it.
+The same applies to images and documents. For example, a question about the handbook answered by GPT-4o mini can be followed by Llama 3.3 searching the same handbook, then Claude Haiku summarizing it into a Word file, all in the same chat.
 
 ---
 
 ## Tech stack
 - **Next.js** (App Router) + **TypeScript**
 - **Tailwind CSS** + **shadcn/ui**
-- **Vercel AI SDK** (`ai`, `@ai-sdk/react`) with the **OpenRouter provider**, plus **Zod** for the tool schema
-- **Vercel Blob** for uploaded and generated images
+- **Vercel AI SDK** (`ai`, `@ai-sdk/react`) with the **OpenRouter provider**, **Zod** for tool schemas and structured outputs
+- **Parsing**: `unpdf`, `mammoth`, `exceljs`
+- **File generation**: `docx`, `pdf-lib`, `exceljs`
+- **Embeddings** via the OpenRouter embeddings API
+- **Vercel Blob** for images, documents, indexes and generated files
 - **Vercel** (Hobby plan) for hosting
 - **localStorage** for conversations
 
@@ -122,7 +171,7 @@ The same applies to images: an image analyzed by one vision model can be discuss
    OPENROUTER_API_KEY=your-openrouter-key
    BLOB_READ_WRITE_TOKEN=your-blob-token
    ```
-   `.env.local` is git-ignored and never committed.
+   `.env.local` is git-ignored and never committed. The same OpenRouter key is used for chat, images and embeddings.
 5. **Start the dev server**
    ```bash
    npm run dev
@@ -133,28 +182,31 @@ The same applies to images: an image analyzed by one vision model can be discuss
 1. Import the GitHub repo at vercel.com/new.
 2. Add `OPENROUTER_API_KEY` under **Environment Variables**.
 3. Create a **Blob** store under **Storage** and connect it to the project. This adds `BLOB_READ_WRITE_TOKEN`.
-4. Deploy. Every push to `main` redeploys automatically.
+4. Deploy. Every push to `main` redeploys automatically, and other branches get preview deployments.
 
 ---
 
 ## Security
-- API keys are **only** used in server routes (`app/api/chat/route.ts`, `app/api/upload/route.ts`, `lib/generate-image.ts`).
-- They're stored in `.env.local` locally (git-ignored) and as **Vercel Environment Variables** in production. They never appear in the repository or in client-side code.
+- API keys are **only** used in server code (`app/api/*/route.ts` and the `lib` files they call). They're stored in `.env.local` locally (git-ignored) and as **Vercel Environment Variables** in production. They never appear in the repository or in client-side code.
 - The server only accepts **chat models from an allow-list**.
-- Uploads are checked server-side: images only (PNG, JPEG, WebP, GIF), max 4 MB.
-- The server only downloads reference images from **our own Blob storage**.
+- Uploads are checked server-side: allowed types only, max 4 MB per file.
+- The server only downloads files from **our own Blob storage**.
 
 ---
 
 ## Known limitations
-- **Chats are stored in the browser** (`localStorage`): they don't sync across devices and are lost if browser data is cleared. Images are stored in Blob, so they stay online.
-- **Images are public**: anyone with an image's link can open it (links are long and random). Images aren't deleted from Blob when a chat is deleted. Don't upload sensitive images.
-- **Generated images aren't "seen" by later models**: models know the prompt and link of a generated image, but only see its pixels if it's used as a reference.
-- **Edits regenerate the whole image**: the image model may change more than asked.
+- **Chats are stored in the browser** (`localStorage`): they don't sync across devices and are lost if browser data is cleared. Files are stored in Blob, so they stay online.
+- **Files are public**: anyone with a file's link can open it (links are long and random). Files aren't deleted from Blob when a chat is deleted. **Don't upload sensitive documents.**
+- **Max 4 MB per file** (Vercel Hobby limits requests to about 4.5 MB). Very large texts are indexed up to about 1.5 million characters.
+- **Scanned PDFs** (no selectable text) aren't read as documents; they can be uploaded as images for a vision model instead. Images inside PDFs and Word files are ignored.
+- **Old formats** (.doc, .xls, .ppt) and PowerPoint files aren't supported.
+- **Generated PDFs use standard fonts**, so only Latin characters are supported (Arabic text, for example, is replaced by "?"). Word and Excel files support all languages.
+- **Generated files are rebuilt from text**: an "edited" Word or PDF file is a new file with the same content and changes, not the original layout, fonts or images.
+- **Vector search runs in the app** (vectors stored as JSON in Blob) rather than in a vector database. This is fine for a few documents per chat, but wouldn't scale to thousands of documents shared across users.
+- **Summaries of very large documents** take 20–40 seconds and must finish within Vercel's 60-second limit; extremely long documents may hit it.
+- **Search can miss information** that is phrased very differently from the question; the model can then read the document part by part.
 - **Image generation is slower** (often 10–30 s) and can occasionally fail. The app retries once and shows the reason if it still fails.
-- **Text-only models** (Llama 3.3) can't see images. They only get a note that an image was shared.
-- **Only one image-generation model** (Gemini 2.5 Flash Image).
+- **Text-only models** (Llama 3.3) can't see images, only a note that an image was shared. They can use documents normally.
 - **Simple history trimming** (last 20 messages); token-based trimming would be more precise.
 - **Model availability depends on OpenRouter**: models can be retired (Claude 3.5 Haiku and Gemini 2.0 Flash were retired during development and replaced).
-- **Vercel Hobby limits**: 4.5 MB per upload request (images are shrunk to fit) and up to 60 s per request.
 - **No user accounts or authentication.**
